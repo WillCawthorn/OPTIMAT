@@ -1,0 +1,163 @@
+First, download the DICOM water- and fat-only images from where they are stored and convert to '.nii' files in MRIcron (https://www.nitrc.org/projects/mricron). Then follow the code below in Matlab:
+
+	1. Create fat fraction maps for each slab/region 
+
+% Read the NIfTI images
+fat_img = niftiread('C:\Users\Samuel Sjostrom\Downloads\Spine_FF_example.nii');
+water_img = niftiread('C:\Users\Samuel Sjostrom\Downloads\Spine_WF_example.nii');
+
+% Apply a Gaussian filter for smoothing to the water and fat images
+sigma = 1.5; % Adjust the sigma for more or less smoothing
+fat_img_smoothed = imgaussfilt(fat_img, sigma);
+water_img_smoothed = imgaussfilt(water_img, sigma);
+
+% Avoid division by zero by adding a small constant
+epsilon = 1e-6;
+denominator = fat_img_smoothed + water_img_smoothed + epsilon;
+
+% Calculate the fat fraction
+fat_fraction = (fat_img_smoothed ./ denominator) * 100;
+
+% Clip values to a valid range if needed
+fat_fraction_smoothed = max(0, min(100, fat_fraction_smoothed));
+
+% Read metadata from one of the original images
+info = niftiinfo('C:\Users\Samuel Sjostrom\Downloads\Spine_FF_example.nii');
+
+% Write the fat fraction map to a new NIfTI file
+niftiwrite(fat_fraction_smoothed, 'fat_fraction.nii', info);
+
+	2. Create fat fraction maps with the same, compatible dimensions for stitching
+
+% List of input and output filenames
+inputFiles = {
+    'Tibia_fat_fraction.nii', 
+    'Femoral_fat_fraction.nii', 
+    'Hip_fat_fraction.nii', 
+    'Pelvis_fat_fraction.nii', 
+    'Spine_fat_fraction.nii', 
+    'Thorax_fat_fraction.nii'
+};
+
+outputFiles = {
+    'resized_tibia_FF.nii', 
+    'resized_femoral_FF.nii', 
+    'resized_hip_FF.nii', 
+    'resized_pelvis_FF.nii', 
+    'resized_spine_FF.nii', 
+    'resized_thorax_FF.nii'
+};
+
+% Desired dimensions
+desiredDimensions = [224, 156, 64];
+
+% Loop through each file, resize, and save
+for i = 1:length(inputFiles)
+    % Load the NIFTI file
+    niftiFile = inputFiles{i};
+    imageData = niftiread(niftiFile);
+
+    % Resize the image to the desired dimensions
+    resizedImage = imresize3(imageData, desiredDimensions);
+
+    % Save the resized image to a new NIFTI file
+    outputFilename = outputFiles{i};
+    niftiwrite(resizedImage, outputFilename);
+
+    disp(['Image saved with dimensions ', num2str(desiredDimensions), ' as ', outputFilename]);
+end
+
+	3. Create one whole-body FF-map image - not stitched together, open in mricron and determine the optimal y-coordinates for vertically joining/stitching the images together in step 4
+
+% List of NIFTI files
+niftiFiles = {'resized_thorax_FF.nii','resized_spine_FF.nii', 'resized_pelvis_FF.nii', 'resized_hip_FF.nii', 'resized_femoral_FF.nii', 'resized_tibia_FF.nii'};
+
+% Initialize a cell array to store the loaded images
+images = cell(1, length(niftiFiles));
+
+% Load each NIFTI file
+for i = 1:length(niftiFiles)
+    images{i} = niftiread(niftiFiles{i});
+end
+
+% Initialize the combined image with the first image, converted to double
+combinedImage = double(images{1});
+
+% Define overlap size (adjust as needed)
+overlap = 10; % Example overlap size
+
+% Loop through and blend each subsequent image
+for i = 2:length(images)
+    currentImage = double(images{i});  % Convert to double
+    
+    % Check the dimensions to ensure compatibility
+    if size(combinedImage, 1) ~= size(currentImage, 1) || size(combinedImage, 3) ~= size(currentImage, 3)
+        error('Images have incompatible dimensions.');
+    end
+    
+    % Define the blending weights
+    w = linspace(0, 1, overlap);
+    w = reshape(w, 1, [], 1); % Ensure w has the correct dimensions for broadcasting
+    
+    % Blend the overlapping region
+    combinedImage(:, end-overlap+1:end, :) = ...
+        combinedImage(:, end-overlap+1:end, :) .* (1 - w) + ...
+        currentImage(:, 1:overlap, :) .* w;
+    
+    % Concatenate the non-overlapping part
+    combinedImage = cat(2, combinedImage, currentImage(:, overlap+1:end, :));
+end
+
+% Define the output NIFTI file name
+outputFilename = 'combined_fat_fraction_map.nii';
+
+% Write the combined image to a new NIFTI file
+niftiwrite(combinedImage, outputFilename);
+
+disp(['Combined image saved as ', outputFilename]);
+
+	4. Generate whole-body fat fraction map by vertically stitching together the image above
+	
+combined_data = niftiread('combined_fat_fraction_map.nii');
+
+% Define the Y-coordinates for each region (change based on the optimal coordinates for each participant)
+y_coords = [52, 195, 347, 499, 650, 801];
+
+% Extract coronal slices from specified Y-coordinates
+thorax_slice = squeeze(combined_data(:, y_coords(1), :));
+spine_slice = squeeze(combined_data(:, y_coords(2), :));
+pelvis_slice = squeeze(combined_data(:, y_coords(3), :));
+hip_slice = squeeze(combined_data(:, y_coords(4), :));
+femoral_slice = squeeze(combined_data(:, y_coords(5), :));
+tibia_slice = squeeze(combined_data(:, y_coords(6), :));
+
+% Define the overlap size for blending
+overlap = 10; % Adjust as needed for smoother transitions
+
+% Function to blend two slices
+blend_slices = @(slice1, slice2, overlap) ...
+    slice1(:, end-overlap+1:end) .* repmat(linspace(1, 0, overlap), size(slice1, 1), 1) + ...
+    slice2(:, 1:overlap) .* repmat(linspace(0, 1, overlap), size(slice2, 1), 1);
+
+% Initialize the stitched image with the first slice
+stitched_image = tibia_slice;
+
+% Blend and concatenate slices
+slices = {femoral_slice, hip_slice, pelvis_slice, spine_slice, thorax_slice};
+
+for i = 1:length(slices)
+    % Blend the overlapping region
+    overlap_region = blend_slices(stitched_image, slices{i}, overlap);
+    
+    % Concatenate the non-overlapping and blended parts
+    stitched_image = [stitched_image(:, 1:end-overlap), overlap_region, slices{i}(:, overlap+1:end)];
+end
+
+%Add color 
+colormap('parula');
+% Add colorbar and label
+c = colorbar;
+ylabel(c, 'Fat Fraction (%)');
+
+% Display the final image
+imshow(stitched_image, []);
